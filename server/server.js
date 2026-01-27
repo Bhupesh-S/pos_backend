@@ -7,7 +7,7 @@ import jwt from "jsonwebtoken";
 const PORT = process.env.PORT || 4001;
 const JWT_SECRET = process.env.JWT_SECRET || "dev_secret";
 const MONGO_URL =
-  process.env.DATABASE_URL || "mongodb://localhost:27017/react_pos_system";
+  process.env.DATABASE_URL || "mongodb+srv://bhupeegayu24_db_user:bhupesh@pos.puixxoi.mongodb.net/?appName=POS";
 
 // --- Mongoose connection ---
 await mongoose.connect(MONGO_URL, { autoIndex: true });
@@ -265,14 +265,30 @@ app.post("/api/products", auth, async (req, res) => {
 
 app.put("/api/products/:id", auth, async (req, res) => {
   const { id } = req.params;
-  const { name, category, price, stock, active, cost, gstRateBps } = req.body;
-  const updated = await Product.findByIdAndUpdate(
-    id,
-    { ...(name != null ? { name } : {}), ...(category != null ? { category } : {}), ...(price != null ? { price } : {}), ...(stock != null ? { stock } : {}), ...(active != null ? { active } : {}), ...(cost != null ? { cost } : {}), ...(gstRateBps != null ? { gstRateBps } : {}) },
-    { new: true }
-  ).lean();
-  if (!updated) return res.status(404).json({ error: "Not found" });
-  res.json({ product: updated });
+  const { name, category, price, stock, active, cost, gstRateBps, sku, barcode } = req.body;
+  try {
+    const updateFields = {};
+    if (name != null) updateFields.name = name;
+    if (category != null) updateFields.category = category;
+    if (price != null) updateFields.price = price;
+    if (stock != null) updateFields.stock = stock;
+    if (active != null) updateFields.active = active;
+    if (cost != null) updateFields.cost = cost;
+    if (gstRateBps != null) updateFields.gstRateBps = gstRateBps;
+    if (sku != null) updateFields.sku = sku;
+    if (barcode != null) updateFields.barcode = barcode;
+    
+    const updated = await Product.findByIdAndUpdate(
+      id,
+      updateFields,
+      { new: true }
+    ).lean();
+    if (!updated) return res.status(404).json({ error: "Not found" });
+    res.json({ product: updated });
+  } catch (e) {
+    if (e.code === 11000) return res.status(409).json({ error: "SKU or Barcode already exists" });
+    res.status(500).json({ error: "Server error" });
+  }
 });
 
 app.delete("/api/products/:id", auth, async (req, res) => {
@@ -312,18 +328,40 @@ app.get("/api/customers", auth, async (req, res) => {
       (c.phone || "").includes(q) ||
       (c.email || "").toLowerCase().includes(q)
   );
+  
+  // Calculate stats for each customer from orders
+  const customerIds = filtered.map(c => String(c._id));
+  const orders = await Order.find({ customerId: { $in: customerIds } }).lean();
+  
+  const customerStats = {};
+  for (const order of orders) {
+    const cid = String(order.customerId);
+    if (!customerStats[cid]) {
+      customerStats[cid] = { totalVisits: 0, totalSpent: 0, lastVisit: null };
+    }
+    customerStats[cid].totalVisits += 1;
+    customerStats[cid].totalSpent += (order.total || 0);
+    const orderDate = new Date(order.createdAt);
+    if (!customerStats[cid].lastVisit || orderDate > customerStats[cid].lastVisit) {
+      customerStats[cid].lastVisit = orderDate;
+    }
+  }
+  
   res.json({
-    customers: filtered.map((c) => ({
-      id: c._id,
-      name: c.name,
-      phone: c.phone || "",
-      email: c.email || "",
-      address: c.address || "",
-      totalVisits: 0,
-      totalSpent: 0,
-      lastVisit: "",
-      history: [],
-    })),
+    customers: filtered.map((c) => {
+      const cid = String(c._id);
+      const stats = customerStats[cid] || { totalVisits: 0, totalSpent: 0, lastVisit: null };
+      return {
+        id: c._id,
+        name: c.name,
+        phone: c.phone || "",
+        email: c.email || "",
+        address: c.address || "",
+        totalVisits: stats.totalVisits,
+        totalSpent: stats.totalSpent,
+        lastVisit: stats.lastVisit ? stats.lastVisit.toISOString() : "",
+      };
+    }),
   });
 });
 
@@ -546,48 +584,142 @@ app.put("/api/settings", auth, async (req, res) => {
 });
 
 // Analytics (simple)
-app.get("/api/analytics/dashboard", auth, async (_req, res) => {
-  const [orders, products, lowStock] = await Promise.all([
-    Order.find().lean(),
+app.get("/api/analytics/dashboard", auth, async (req, res) => {
+  const period = req.query.period || '7d'; // today, 7d, 30d, custom
+  
+  // Calculate date range based on period
+  const now = new Date();
+  let startDate;
+  
+  switch (period) {
+    case 'today':
+      startDate = new Date(now);
+      startDate.setHours(0, 0, 0, 0);
+      break;
+    case '30d':
+      startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+      break;
+    case '7d':
+    default:
+      startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+      break;
+  }
+  
+  // Fetch orders within the period
+  const [allOrders, products, lowStock] = await Promise.all([
+    Order.find({ createdAt: { $gte: startDate } }).lean(),
     Product.find({ active: true }).lean(),
     Product.countDocuments({ active: true, stock: { $lte: 10 } }),
   ]);
-  const totalRevenue = orders.reduce((s, o) => s + (o.total || 0), 0);
-  const totalTax = orders.reduce((s, o) => s + (o.taxAmount || 0), 0);
+  
+  // Calculate current period stats
+  const totalRevenue = allOrders.reduce((s, o) => s + (o.total || 0), 0);
+  const totalTax = allOrders.reduce((s, o) => s + (o.taxAmount || 0), 0);
   const productCostMap = new Map(products.map((p) => [String(p._id), Number(p.cost || 0)]));
   let profit = 0;
-  for (const o of orders) {
+  for (const o of allOrders) {
     for (const i of o.items) {
       const cost = productCostMap.get(String(i.productId)) || 0;
       profit += Number(i.qty || 0) * (Number(i.price || 0) - Number(cost));
     }
   }
-  // Build last 7 days sales overview
+  
+  // Calculate comparison period for percentage changes
+  let comparisonStartDate;
+  let comparisonEndDate = startDate;
+  
+  switch (period) {
+    case 'today':
+      // Compare with yesterday
+      comparisonStartDate = new Date(startDate);
+      comparisonStartDate.setDate(startDate.getDate() - 1);
+      comparisonEndDate = new Date(startDate);
+      break;
+    case '30d':
+      // Compare with previous 30 days
+      comparisonStartDate = new Date(startDate.getTime() - 30 * 24 * 60 * 60 * 1000);
+      break;
+    case '7d':
+    default:
+      // Compare with previous 7 days
+      comparisonStartDate = new Date(startDate.getTime() - 7 * 24 * 60 * 60 * 1000);
+      break;
+  }
+  
+  const previousOrders = await Order.find({
+    createdAt: { $gte: comparisonStartDate, $lt: comparisonEndDate }
+  }).lean();
+  
+  const previousRevenue = previousOrders.reduce((s, o) => s + (o.total || 0), 0);
+  
+  // Calculate percentage changes
+  const revenueChange = previousRevenue > 0 
+    ? ((totalRevenue - previousRevenue) / previousRevenue * 100).toFixed(1)
+    : 0;
+  const ordersChange = previousOrders.length > 0
+    ? ((allOrders.length - previousOrders.length) / previousOrders.length * 100).toFixed(1)
+    : 0;
+  
+  // Build sales data for chart based on period
   const byDay = {};
-  const today = new Date();
-  for (let d = 6; d >= 0; d--) {
-    const day = new Date(today);
-    day.setDate(today.getDate() - d);
+  const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const weeklySales = [];
+  
+  let daysToShow = 7;
+  if (period === 'today') daysToShow = 1;
+  if (period === '30d') daysToShow = 30;
+  
+  for (let d = daysToShow - 1; d >= 0; d--) {
+    const day = new Date(now);
+    day.setDate(now.getDate() - d);
     const key = day.toISOString().slice(0, 10);
     byDay[key] = 0;
   }
-  for (const o of orders) {
+  
+  for (const o of allOrders) {
     const key = new Date(o.createdAt).toISOString().slice(0, 10);
     if (byDay[key] != null) byDay[key] += (o.total || 0);
   }
+  
+  // Format for chart
+  if (period === 'today' || period === '7d') {
+    // Show day names for today and 7d
+    Object.entries(byDay).forEach(([date, sales]) => {
+      const dayDate = new Date(date);
+      const dayName = period === 'today' ? 'Today' : dayNames[dayDate.getDay()];
+      weeklySales.push({ day: dayName, sales: Math.round(sales) });
+    });
+  } else {
+    // Show dates for 30d
+    Object.entries(byDay).forEach(([date, sales]) => {
+      const dayDate = new Date(date);
+      const dayLabel = `${dayDate.getDate()}/${dayDate.getMonth() + 1}`;
+      weeklySales.push({ day: dayLabel, sales: Math.round(sales) });
+    });
+  }
+  
   const salesOverview = Object.entries(byDay).map(([name, sales]) => ({ name, sales }));
+  
   res.json({
     stats: {
       totalRevenue,
-      totalOrders: orders.length,
+      totalOrders: allOrders.length,
       totalProducts: products.length,
       lowStock,
       taxCollected: totalTax,
       profit,
+      revenueChange: parseFloat(revenueChange),
+      ordersChange: parseFloat(ordersChange),
+      productsChange: 0,
+      lowStockChange: 0,
     },
     salesOverview,
-    recentTransactions: orders.slice(0, 5).map((o) => ({ invoiceNo: o.invoiceNo, date: o.createdAt, total: o.total })),
-    topSelling: await getTopSellingProducts(orders),
+    weeklySales,
+    recentTransactions: allOrders
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+      .slice(0, 5)
+      .map((o) => ({ invoiceNo: o.invoiceNo, date: o.createdAt, total: o.total })),
+    topSelling: await getTopSellingProducts(allOrders),
   });
 });
 
