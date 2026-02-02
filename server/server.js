@@ -4,10 +4,10 @@ import cors from "cors";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 
-const PORT = process.env.PORT || 4001;
-const JWT_SECRET = process.env.JWT_SECRET || "dev_secret";
+const PORT = process.env.PORT;
+const JWT_SECRET = process.env.JWT_SECRET ;
 const MONGO_URL =
-  process.env.DATABASE_URL || "mongodb+srv://bhupeegayu24_db_user:bhupesh@pos.puixxoi.mongodb.net/?appName=POS";
+  process.env.DATABASE_URL;
 
 // --- Mongoose connection ---
 await mongoose.connect(MONGO_URL, { autoIndex: true });
@@ -112,6 +112,19 @@ const settingsSchema = new mongoose.Schema(
   { timestamps: true }
 );
 const Settings = mongoose.model("Settings", settingsSchema);
+
+// Processed Actions (for idempotency)
+const processedActionSchema = new mongoose.Schema(
+  {
+    actionId: { type: String, unique: true, required: true },
+    entityType: String,
+    entityId: String,
+    actionType: String,
+    processedAt: { type: Date, default: Date.now },
+  },
+  { timestamps: true }
+);
+const ProcessedAction = mongoose.model("ProcessedAction", processedActionSchema);
 
 // --- App setup ---
 const app = express();
@@ -582,6 +595,160 @@ app.put("/api/settings", auth, async (req, res) => {
     },
   });
 });
+
+// ========== EVENT SOURCING SYNC ENDPOINTS ==========
+
+// Process action from client (idempotent)
+app.post("/api/sync/actions", auth, async (req, res) => {
+  const { actionId, entityType, entityId, actionType, payload, version, timestamp } = req.body;
+  
+  if (!actionId || !entityType || !entityId || !actionType) {
+    return res.status(400).json({ error: "Missing required fields" });
+  }
+
+  try {
+    // Check if action already processed (idempotency)
+    const existing = await ProcessedAction.findOne({ actionId });
+    if (existing) {
+      console.log(`[Sync] Action ${actionId} already processed (idempotent)`);
+      return res.json({ status: "already_processed" });
+    }
+
+    // Process action based on entity type
+    let result;
+    switch (entityType) {
+      case "product":
+        result = await processProductAction(actionId, entityId, actionType, payload, version);
+        break;
+      case "customer":
+        result = await processCustomerAction(actionId, entityId, actionType, payload, version);
+        break;
+      case "order":
+        result = await processOrderAction(actionId, entityId, actionType, payload, version);
+        break;
+      case "category":
+        result = await processCategoryAction(actionId, entityId, actionType, payload, version);
+        break;
+      default:
+        return res.status(400).json({ error: `Unknown entity type: ${entityType}` });
+    }
+
+    if (result.conflict) {
+      return res.status(409).json({
+        error: "Version conflict",
+        serverVersion: result.serverVersion,
+        serverData: result.serverData,
+      });
+    }
+
+    // Record action as processed
+    await ProcessedAction.create({ actionId, entityType, entityId, actionType });
+
+    res.json({ status: "success", newVersion: result.newVersion });
+  } catch (error) {
+    console.error("[Sync] Error processing action:", error);
+    res.status(500).json({ error: error.message || "Server error" });
+  }
+});
+
+// Get changes since timestamp
+app.get("/api/sync/changes", auth, async (req, res) => {
+  const since = parseInt(req.query.since) || 0;
+  const sinceDate = new Date(since);
+
+  try {
+    const [products, customers, orders, categories] = await Promise.all([
+      Product.find({ updatedAt: { $gte: sinceDate }, active: true }).lean(),
+      Customer.find({ updatedAt: { $gte: sinceDate } }).lean(),
+      Order.find({ updatedAt: { $gte: sinceDate } }).lean(),
+      Category.find({ updatedAt: { $gte: sinceDate } }).lean(),
+    ]);
+
+    res.json({
+      products: products.map(p => ({
+        id: p._id,
+        name: p.name,
+        category: p.category,
+        price: p.price,
+        stock: p.stock,
+        sku: p.sku,
+        barcode: p.barcode,
+        cost: p.cost,
+        gstRateBps: p.gstRateBps,
+        active: p.active,
+      })),
+      customers: customers.map(c => ({
+        id: c._id,
+        name: c.name,
+        phone: c.phone,
+        email: c.email,
+        address: c.address,
+      })),
+      orders: orders.map(o => ({
+        id: o._id,
+        invoiceNo: o.invoiceNo,
+        status: o.status,
+        paymentType: o.paymentType,
+        taxRateBps: o.taxRateBps,
+        subtotal: o.subtotal,
+        taxAmount: o.taxAmount,
+        total: o.total,
+        customerId: o.customerId,
+        items: o.items,
+      })),
+      categories: categories.map(c => ({
+        id: c._id,
+        name: c.name,
+      })),
+    });
+  } catch (error) {
+    console.error("[Sync] Error getting changes:", error);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Helper functions for processing actions
+async function processProductAction(actionId, entityId, actionType, payload, version) {
+  if (actionType === "CREATE") {
+    const product = await Product.create({
+      _id: entityId,
+      ...payload,
+    });
+    return { newVersion: 1 };
+  } else if (actionType === "UPDATE") {
+    const updated = await Product.findByIdAndUpdate(entityId, payload, { new: true });
+    return { newVersion: version };
+  } else if (actionType === "DELETE") {
+    await Product.findByIdAndUpdate(entityId, { active: false });
+    return { newVersion: version };
+  }
+}
+
+async function processCustomerAction(actionId, entityId, actionType, payload, version) {
+  if (actionType === "CREATE") {
+    await Customer.create({ _id: entityId, ...payload });
+    return { newVersion: 1 };
+  } else if (actionType === "UPDATE") {
+    await Customer.findByIdAndUpdate(entityId, payload);
+    return { newVersion: version };
+  }
+}
+
+async function processOrderAction(actionId, entityId, actionType, payload, version) {
+  if (actionType === "CREATE") {
+    await Order.create({ _id: entityId, ...payload });
+    return { newVersion: 1 };
+  }
+}
+
+async function processCategoryAction(actionId, entityId, actionType, payload, version) {
+  if (actionType === "CREATE") {
+    await Category.create({ _id: entityId, ...payload });
+    return { newVersion: 1 };
+  }
+}
+
+// ========== END SYNC ENDPOINTS ==========
 
 // Analytics (simple)
 app.get("/api/analytics/dashboard", auth, async (req, res) => {
