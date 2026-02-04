@@ -420,6 +420,7 @@ app.get("/api/orders", auth, async (_req, res) => {
   res.json({
     orders: orders.map((o) => ({
       id: o.invoiceNo,
+      invoiceNo: o.invoiceNo,
       date: o.createdAt.toISOString().slice(0, 10),
       customer: o.customerId || "Walk-in Customer",
       total: o.total,
