@@ -417,12 +417,20 @@ app.get("/api/customers/:id/history", auth, async (req, res) => {
 // Orders
 app.get("/api/orders", auth, async (_req, res) => {
   const orders = await Order.find().sort({ createdAt: -1 }).lean();
+  
+  // Get all unique customer IDs
+  const customerIds = [...new Set(orders.map(o => o.customerId).filter(Boolean))];
+  
+  // Fetch customer names
+  const customers = await Customer.find({ _id: { $in: customerIds } }).lean();
+  const customerMap = new Map(customers.map(c => [String(c._id), c.name]));
+  
   res.json({
     orders: orders.map((o) => ({
       id: o.invoiceNo,
-      invoiceNo: o.invoiceNo,
+      invoiceNo: o.invoiceNo, // Add this for frontend sync
       date: o.createdAt.toISOString().slice(0, 10),
-      customer: o.customerId || "Walk-in Customer",
+      customer: o.customerId ? (customerMap.get(String(o.customerId)) || "Walk-in Customer") : "Walk-in Customer",
       total: o.total,
       subtotal: o.subtotal || 0,
       taxAmount: o.taxAmount || 0,
@@ -1161,5 +1169,5 @@ async function getTopSellingProducts(orders) {
 
 // --- Start server ---
 app.listen(PORT, () => {
-  console.log(`API listening on http://localhost:${PORT}`);
+  console.log(`${PORT}`);
 });
