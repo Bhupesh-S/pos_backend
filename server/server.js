@@ -710,10 +710,9 @@ app.get("/api/sync/changes", auth, async (req, res) => {
 // Helper functions for processing actions
 async function processProductAction(actionId, entityId, actionType, payload, version) {
   if (actionType === "CREATE") {
-    const product = await Product.create({
-      _id: entityId,
-      ...payload,
-    });
+    // Don't use entityId as _id - let MongoDB generate its own ObjectId
+    const { _id, id, ...productData } = payload;
+    const product = await Product.create(productData);
     return { newVersion: 1 };
   } else if (actionType === "UPDATE") {
     const updated = await Product.findByIdAndUpdate(entityId, payload, { new: true });
@@ -726,7 +725,9 @@ async function processProductAction(actionId, entityId, actionType, payload, ver
 
 async function processCustomerAction(actionId, entityId, actionType, payload, version) {
   if (actionType === "CREATE") {
-    await Customer.create({ _id: entityId, ...payload });
+    // Don't use entityId as _id - let MongoDB generate its own ObjectId
+    const { _id, id, ...customerData } = payload;
+    await Customer.create(customerData);
     return { newVersion: 1 };
   } else if (actionType === "UPDATE") {
     await Customer.findByIdAndUpdate(entityId, payload);
@@ -736,14 +737,19 @@ async function processCustomerAction(actionId, entityId, actionType, payload, ve
 
 async function processOrderAction(actionId, entityId, actionType, payload, version) {
   if (actionType === "CREATE") {
-    await Order.create({ _id: entityId, ...payload });
+    // Don't use entityId as _id - let MongoDB generate its own ObjectId
+    // The entityId is the local SQLite ID which is incompatible with MongoDB ObjectId
+    const { _id, id, ...orderData } = payload; // Remove any id fields from payload
+    await Order.create(orderData);
     return { newVersion: 1 };
   }
 }
 
 async function processCategoryAction(actionId, entityId, actionType, payload, version) {
   if (actionType === "CREATE") {
-    await Category.create({ _id: entityId, ...payload });
+    // Don't use entityId as _id - let MongoDB generate its own ObjectId
+    const { _id, id, ...categoryData } = payload;
+    await Category.create(categoryData);
     return { newVersion: 1 };
   }
 }
