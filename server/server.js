@@ -57,7 +57,7 @@ const customerSchema = new mongoose.Schema(
 
 const orderSchema = new mongoose.Schema(
   {
-    invoiceNo: String,
+    invoiceNo: { type: String, unique: true, required: true },
     status: { type: String, default: "PAID" }, // PAID | PENDING | CANCELLED
     paymentType: { type: String, default: "CASH" }, // CASH | CARD | ONLINE
     taxRateBps: { type: Number, default: 0 },
@@ -471,7 +471,10 @@ app.post("/api/orders", auth, async (req, res) => {
     }
   }
 
-  const invoiceNo = `INV-${Date.now()}`;
+  const date = new Date();
+  const dateStr = date.toISOString().slice(0, 10).replace(/-/g, ''); // YYYYMMDD
+  const random = Math.random().toString(36).substr(2, 4).toUpperCase(); // 4 chars
+  const invoiceNo = `INV-${dateStr}-${random}`;
   const subtotal = items.reduce((s, i) => s + Number(i.price || 0) * Number(i.qty || 0), 0);
   const taxAmount = Math.round((subtotal * taxRateBps) / 10000);
   const total = subtotal + taxAmount;
